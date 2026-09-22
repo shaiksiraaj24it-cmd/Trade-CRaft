@@ -18,6 +18,9 @@ const TABLES = {
   QuizAttempt: 'quiz_attempts',
   Stock: 'stocks',
   User: 'profiles',
+  Portfolio: 'portfolios',
+  Holding: 'holdings',
+  Transaction: 'transactions',
 };
 
 // Sort strings use a leading "-" for descending order.
@@ -209,4 +212,205 @@ const users = {
   },
 };
 
-export const api = { auth, entities, users, app };
+const trading = {
+  async getOrCreatePortfolio() {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error('User not authenticated');
+
+    const { data, error } = await supabase
+      .from('portfolios')
+      .select('*')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (error && error.code !== 'PGRST116') {
+      throw toApiError(error, 'Failed to fetch portfolio');
+    }
+
+    if (data) return data;
+
+    // Create default portfolio with ₹1,00,000 virtual cash
+    const { data: newPort, error: createErr } = await supabase
+      .from('portfolios')
+      .insert({ user_id: user.id, virtual_cash: 100000.00 })
+      .select()
+      .single();
+
+    if (createErr) throw toApiError(createErr, 'Failed to initialize paper trading portfolio');
+    return newPort;
+  },
+
+  async resetPortfolio() {
+    const port = await this.getOrCreatePortfolio();
+    const { data: { user } } = await supabase.auth.getUser();
+
+    // Reset cash to 100,000
+    const { error: portErr } = await supabase
+      .from('portfolios')
+      .update({ virtual_cash: 100000.00 })
+      .eq('id', port.id);
+    if (portErr) throw toApiError(portErr, 'Failed to reset cash balance');
+
+    // Remove holdings
+    await supabase.from('holdings').delete().eq('portfolio_id', port.id);
+
+    // Record reset transaction log or clear transactions
+    await supabase.from('transactions').delete().eq('user_id', user.id);
+
+    return { success: true };
+  },
+
+  async getHoldings() {
+    const port = await this.getOrCreatePortfolio();
+    const { data, error } = await supabase
+      .from('holdings')
+      .select('*')
+      .eq('portfolio_id', port.id);
+
+    if (error) throw toApiError(error, 'Failed to fetch holdings');
+    return data || [];
+  },
+
+  async getTransactions() {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return [];
+
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_date', { ascending: false });
+
+    if (error) throw toApiError(error, 'Failed to fetch transactions');
+    return data || [];
+  },
+
+  async executeTrade({ stockId, symbol, type, shares, price }) {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error('User not authenticated');
+
+    const port = await this.getOrCreatePortfolio();
+    const qty = Number(shares);
+    const unitPrice = Number(price);
+    const totalAmount = qty * unitPrice;
+
+    if (isNaN(qty) || qty <= 0) throw new Error('Invalid quantity');
+    if (isNaN(unitPrice) || unitPrice < 0) throw new Error('Invalid price');
+
+    const currentCash = Number(port.virtual_cash);
+
+    if (type === 'BUY') {
+      if (currentCash < totalAmount) {
+        throw new Error(`Insufficient virtual balance. Required: ₹${totalAmount.toFixed(2)}, Available: ₹${currentCash.toFixed(2)}`);
+      }
+
+      // Check existing holding
+      const { data: existingHolding } = await supabase
+        .from('holdings')
+        .select('*')
+        .eq('portfolio_id', port.id)
+        .eq('stock_id', stockId)
+        .maybeSingle();
+
+      let newShares = qty;
+      let newAvgPrice = unitPrice;
+
+      if (existingHolding) {
+        const oldShares = Number(existingHolding.shares);
+        const oldAvg = Number(existingHolding.average_buy_price);
+        newShares = oldShares + qty;
+        newAvgPrice = ((oldShares * oldAvg) + (qty * unitPrice)) / newShares;
+
+        const { error: updateHoldingErr } = await supabase
+          .from('holdings')
+          .update({
+            shares: newShares,
+            average_buy_price: newAvgPrice,
+          })
+          .eq('id', existingHolding.id);
+
+        if (updateHoldingErr) throw toApiError(updateHoldingErr, 'Failed to update holding');
+      } else {
+        const { error: insertHoldingErr } = await supabase
+          .from('holdings')
+          .insert({
+            portfolio_id: port.id,
+            stock_id: stockId,
+            symbol,
+            shares: newShares,
+            average_buy_price: newAvgPrice,
+          });
+
+        if (insertHoldingErr) throw toApiError(insertHoldingErr, 'Failed to create holding');
+      }
+
+      // Deduct cash
+      const { error: updateCashErr } = await supabase
+        .from('portfolios')
+        .update({ virtual_cash: currentCash - totalAmount })
+        .eq('id', port.id);
+
+      if (updateCashErr) throw toApiError(updateCashErr, 'Failed to update balance');
+
+    } else if (type === 'SELL') {
+      // Check existing holding
+      const { data: existingHolding } = await supabase
+        .from('holdings')
+        .select('*')
+        .eq('portfolio_id', port.id)
+        .eq('stock_id', stockId)
+        .maybeSingle();
+
+      const oldShares = existingHolding ? Number(existingHolding.shares) : 0;
+
+      if (!existingHolding || oldShares < qty) {
+        throw new Error(`Insufficient shares to sell. Available: ${oldShares}, Attempted: ${qty}`);
+      }
+
+      const remainingShares = oldShares - qty;
+
+      if (remainingShares > 0) {
+        const { error: updateHoldingErr } = await supabase
+          .from('holdings')
+          .update({ shares: remainingShares })
+          .eq('id', existingHolding.id);
+
+        if (updateHoldingErr) throw toApiError(updateHoldingErr, 'Failed to update holding');
+      } else {
+        const { error: deleteHoldingErr } = await supabase
+          .from('holdings')
+          .delete()
+          .eq('id', existingHolding.id);
+
+        if (deleteHoldingErr) throw toApiError(deleteHoldingErr, 'Failed to update holding');
+      }
+
+      // Add cash
+      const { error: updateCashErr } = await supabase
+        .from('portfolios')
+        .update({ virtual_cash: currentCash + totalAmount })
+        .eq('id', port.id);
+
+      if (updateCashErr) throw toApiError(updateCashErr, 'Failed to update balance');
+    }
+
+    // Insert transaction record
+    const { error: txErr } = await supabase
+      .from('transactions')
+      .insert({
+        user_id: user.id,
+        stock_id: stockId,
+        symbol,
+        type,
+        shares: qty,
+        price: unitPrice,
+        total_amount: totalAmount,
+      });
+
+    if (txErr) console.warn('Trade completed but log creation failed', txErr);
+
+    return { success: true };
+  },
+};
+
+export const api = { auth, entities, users, app, trading };
